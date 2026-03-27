@@ -5,12 +5,46 @@ declare(strict_types=1);
 /**
  * Simple file-based cache for GitHub contribution stats
  *
- * Caches stats for 24 hours to avoid repeated API calls
+ * Caches stats for 24 hours to avoid repeated API calls.
+ * Made safer for serverless environments like Vercel:
+ * - prefers /tmp
+ * - never prints mkdir/file warnings into image output
+ * - gracefully skips caching if filesystem is unavailable
  */
 
 // Default cache duration: 24 hours (in seconds)
 define("CACHE_DURATION", 24 * 60 * 60);
-define("CACHE_DIR", __DIR__ . "/../cache");
+
+/**
+ * Get the best writable cache directory for the current environment.
+ *
+ * @return string
+ */
+function getCacheDir(): string
+{
+    $candidates = [
+        "/tmp/github-readme-streak-stats-cache",
+        rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . "github-readme-streak-stats-cache",
+        __DIR__ . "/cache",
+    ];
+
+    foreach ($candidates as $dir) {
+        $parent = dirname($dir);
+
+        if (is_dir($dir) && is_writable($dir)) {
+            return $dir;
+        }
+
+        if (is_dir($parent) && is_writable($parent)) {
+            return $dir;
+        }
+    }
+
+    // Final fallback; caching will just fail gracefully if this is not writable
+    return "/tmp/github-readme-streak-stats-cache";
+}
+
+define("CACHE_DIR", getCacheDir());
 
 /**
  * Generate a cache key for a user's request
@@ -19,19 +53,23 @@ define("CACHE_DIR", __DIR__ . "/../cache");
  * user/options combinations that could produce the same concatenated string.
  *
  * @param string $user GitHub username
- * @param array $options Additional options that affect the stats (mode, exclude_days, starting_year)
+ * @param array $options Additional options that affect the stats
  * @return string Cache key (filename-safe)
  */
 function getCacheKey(string $user, array $options = []): string
 {
     ksort($options);
+
     try {
-        $keyData = json_encode(["user" => $user, "options" => $options], JSON_THROW_ON_ERROR);
+        $keyData = json_encode(
+            ["user" => $user, "options" => $options],
+            JSON_THROW_ON_ERROR
+        );
     } catch (JsonException $e) {
-        // Fallback to simple concatenation if JSON encoding fails
         error_log("Cache key JSON encoding failed: " . $e->getMessage());
         $keyData = $user . serialize($options);
     }
+
     return hash("sha256", $keyData);
 }
 
@@ -43,7 +81,7 @@ function getCacheKey(string $user, array $options = []): string
  */
 function getCacheFilePath(string $key): string
 {
-    return CACHE_DIR . "/" . $key . ".json";
+    return rtrim(CACHE_DIR, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $key . ".json";
 }
 
 /**
@@ -53,10 +91,26 @@ function getCacheFilePath(string $key): string
  */
 function ensureCacheDir(): bool
 {
-    if (!is_dir(CACHE_DIR)) {
-        return mkdir(CACHE_DIR, 0755, true);
+    if (is_dir(CACHE_DIR)) {
+        return is_writable(CACHE_DIR);
     }
-    return true;
+
+    $parent = dirname(CACHE_DIR);
+
+    if (!is_dir($parent) || !is_writable($parent)) {
+        error_log("Cache parent directory is not writable: " . $parent);
+        return false;
+    }
+
+    // Suppress PHP warnings from leaking into image output
+    $created = @mkdir(CACHE_DIR, 0755, true);
+
+    if ($created === false && !is_dir(CACHE_DIR)) {
+        error_log("Failed to create cache directory: " . CACHE_DIR);
+        return false;
+    }
+
+    return is_writable(CACHE_DIR);
 }
 
 /**
@@ -64,7 +118,7 @@ function ensureCacheDir(): bool
  *
  * @param string $user GitHub username
  * @param array $options Additional options
- * @param int $maxAge Maximum age in seconds (default: 24 hours)
+ * @param int $maxAge Maximum age in seconds
  * @return array|null Cached stats array or null if not cached/expired
  */
 function getCachedStats(string $user, array $options = [], int $maxAge = CACHE_DURATION): ?array
@@ -72,33 +126,34 @@ function getCachedStats(string $user, array $options = [], int $maxAge = CACHE_D
     $key = getCacheKey($user, $options);
     $filePath = getCacheFilePath($key);
 
-    if (!file_exists($filePath)) {
+    if (!is_file($filePath)) {
         return null;
     }
 
-    $mtime = filemtime($filePath);
+    $mtime = @filemtime($filePath);
     if ($mtime === false) {
         return null;
     }
 
     $fileAge = time() - $mtime;
     if ($fileAge > $maxAge) {
-        unlink($filePath);
+        @unlink($filePath);
         return null;
     }
 
-    $handle = fopen($filePath, "r");
+    $handle = @fopen($filePath, "r");
     if ($handle === false) {
         return null;
     }
 
-    if (!flock($handle, LOCK_SH)) {
+    if (!@flock($handle, LOCK_SH)) {
         fclose($handle);
         return null;
     }
 
     $contents = stream_get_contents($handle);
-    flock($handle, LOCK_UN);
+
+    @flock($handle, LOCK_UN);
     fclose($handle);
 
     if ($contents === false || $contents === "") {
@@ -124,7 +179,6 @@ function getCachedStats(string $user, array $options = [], int $maxAge = CACHE_D
 function setCachedStats(string $user, array $options, array $stats): bool
 {
     if (!ensureCacheDir()) {
-        error_log("Failed to create cache directory: " . CACHE_DIR);
         return false;
     }
 
@@ -137,7 +191,7 @@ function setCachedStats(string $user, array $options, array $stats): bool
         return false;
     }
 
-    $result = file_put_contents($filePath, $data, LOCK_EX);
+    $result = @file_put_contents($filePath, $data, LOCK_EX);
     if ($result === false) {
         error_log("Failed to write cache file: " . $filePath);
         return false;
@@ -159,20 +213,21 @@ function clearExpiredCache(int $maxAge = CACHE_DURATION): int
     }
 
     $deleted = 0;
-    $files = glob(CACHE_DIR . "/*.json");
+    $files = @glob(rtrim(CACHE_DIR, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . "*.json");
 
     if ($files === false) {
         return 0;
     }
 
     foreach ($files as $file) {
-        $mtime = filemtime($file);
+        $mtime = @filemtime($file);
         if ($mtime === false) {
             continue;
         }
+
         $fileAge = time() - $mtime;
         if ($fileAge > $maxAge) {
-            if (unlink($file)) {
+            if (@unlink($file)) {
                 $deleted++;
             }
         }
@@ -183,11 +238,6 @@ function clearExpiredCache(int $maxAge = CACHE_DURATION): int
 
 /**
  * Clear cache for a specific user
- *
- * Note: This function only clears the cache for the user with empty/default options.
- * Cache entries with non-empty options (starting_year, mode, exclude_days) will NOT
- * be cleared. This is a limitation of the hash-based cache key system - we cannot
- * enumerate all possible option combinations without storing additional metadata.
  *
  * @param string $user GitHub username
  * @return bool True if cache was cleared (or didn't exist)
@@ -202,7 +252,7 @@ function clearUserCache(string $user): bool
     $filePath = getCacheFilePath($key);
 
     if (file_exists($filePath)) {
-        return unlink($filePath);
+        return @unlink($filePath);
     }
 
     return true;
