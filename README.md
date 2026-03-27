@@ -6,7 +6,7 @@
 <p align="center">
   Display your total contributions, current streak,
   <br/>
-  and longest streak on your GitHub profile README
+  and longest streak on your GitHub profile README 
 </p>
 
 <p align="center">
